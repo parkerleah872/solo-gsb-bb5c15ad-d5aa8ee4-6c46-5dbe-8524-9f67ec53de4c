@@ -54,6 +54,22 @@ export interface Project {
   singers: Singer[];
 }
 
+/**
+ * 排练快照：冻结保存时刻的声部、歌手与换气区间（均为深拷贝，之后工程改动不影响快照）。
+ * 节拍图 / 曲名 / 全曲时长不在冻结范围内——恢复快照时这些字段保持当前工程现状。
+ */
+export interface RehearsalSnapshot {
+  id: string;
+  /** 用户命名的快照名称（缺省时自动生成） */
+  name: string;
+  /** 创建时间（epoch 毫秒） */
+  createdAt: number;
+  /** 保存时的曲名（仅展示用，恢复时不覆盖当前曲名） */
+  projectName: string;
+  parts: VoicePart[];
+  singers: Singer[];
+}
+
 /** 当前选中的换气段 */
 export interface Selection {
   singerId: string;

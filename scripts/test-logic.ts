@@ -14,6 +14,16 @@ import {
 } from '../src/lib/tempo';
 import { placeNewIntervalOnBeat } from '../src/lib/constraints';
 import { applyRelay, planRelay } from '../src/lib/relay';
+import {
+  createSnapshot,
+  defaultSnapshotName,
+  diffProjectSnapshot,
+  diffStructure,
+  loadSnapshots,
+  restoreProjectSnapshot,
+  sanitizeSnapshot,
+  saveSnapshots,
+} from '../src/lib/snapshot';
 import type { Project } from '../src/types';
 import { uid } from '../src/lib/id';
 
@@ -389,6 +399,283 @@ const beatTimes = (p: Project, beats: number[]) => beats.map((b) => beatToTime(b
         .sort((x, y) => x[0] - y[0]),
     );
   }
+}
+
+// ---------- 排练快照：冻结、按歌手 ID 对齐的区间差异、恢复、清洗与持久化 ----------
+
+/** 复制工程并按 id 覆盖 / 增删歌手换气，便于构造差异场景。 */
+function withBreaths(p: Project, singerId: string, breaths: [number, number][]): Project {
+  return {
+    ...p,
+    singers: p.singers.map((s) =>
+      s.id !== singerId
+        ? s
+        : { ...s, breaths: breaths.map(([start, end]) => ({ id: uid(), start, end })) },
+    ),
+  };
+}
+
+/** 用既有区间 id 覆盖单个区间（用于移动 / 时长差异）。 */
+function updateBreath(p: Project, singerId: string, intervalId: string, start: number, end: number): Project {
+  return {
+    ...p,
+    singers: p.singers.map((s) =>
+      s.id !== singerId
+        ? s
+        : { ...s, breaths: s.breaths.map((b) => (b.id !== intervalId ? b : { ...b, start, end })) },
+    ),
+  };
+}
+
+// 27. 快照冻结：保存后修改 / 删除工程中的声部歌手与区间，快照内容不变（深拷贝）
+{
+  const p = relayProject([[[1, 3]], [[5, 7]]], { minSingers: 1, bpm: 120 });
+  const snap = createSnapshot(p, '排练前');
+  let changed: Project = {
+    ...p,
+    parts: p.parts.map((pt) => (pt.id === 'p1' ? { ...pt, name: '改名声部' } : pt)),
+    singers: p.singers.map((s, i) => (i === 0 ? { ...s, name: '改名歌手' } : s)),
+  };
+  changed = withBreaths(changed, changed.singers[0].id, [[9, 11]]);
+  check('snapshot frozen name', snap.name, '排练前');
+  check(
+    'snapshot frozen parts',
+    snap.parts.map((pt) => pt.name),
+    ['测试声部'],
+  );
+  check(
+    'snapshot frozen breaths',
+    snap.singers.map((s) => s.breaths.map((b) => [b.start, b.end])),
+    [[[1, 3]], [[5, 7]]],
+  );
+  check('snapshot projectName recorded', snap.projectName, 'relay-test');
+  check('snapshot has no beatmap', (snap as unknown as Record<string, unknown>).beatMap, undefined);
+}
+
+// 28. 差异基本类型：新增 / 删除 / 移动（等时长平移）/ 时长变化（起点不变改终点）
+{
+  const p = relayProject([[], []], { minSingers: 1, bpm: 120 });
+  const s0 = p.singers[0].id;
+  const s1 = p.singers[1].id;
+  const base: Project = {
+    ...p,
+    singers: p.singers.map((s) =>
+      s.id === s0
+        ? { ...s, breaths: [{ id: 'move', start: 2, end: 4 }, { id: 'keep', start: 8, end: 10 }] }
+        : s.id === s1
+          ? { ...s, breaths: [{ id: 'gone', start: 12, end: 14 }, { id: 'resize', start: 20, end: 22 }] }
+          : s,
+    ),
+  };
+  const snap = createSnapshot(base);
+  let cur: Project = { ...base };
+  // move：[2,4) → [5,7)（等时长）；gone 删除；resize [20,22) → [20,24)（仅时长）；新增 [30,32)
+  cur = updateBreath(cur, s0, 'move', 5, 7);
+  cur = {
+    ...cur,
+    singers: cur.singers.map((s) =>
+      s.id === s1
+        ? { ...s, breaths: s.breaths.filter((b) => b.id !== 'gone').map((b) => (b.id === 'resize' ? { ...b, end: 24 } : b)) }
+        : s,
+    ),
+  };
+  cur = {
+    ...cur,
+    singers: cur.singers.map((s) =>
+      s.id === s0 ? { ...s, breaths: [...s.breaths, { id: 'added1', start: 30, end: 32 }] } : s,
+    ),
+  };
+  const d = diffProjectSnapshot(cur, snap);
+  check(
+    'snapshot diff types',
+    d.map((e) => [e.type, e.singerName, e.intervalId]),
+    [
+      ['moved', '歌手1', 'move'],
+      ['removed', '歌手2', 'gone'],
+      ['duration', '歌手2', 'resize'],
+      ['added', '歌手1', 'added1'],
+    ],
+  );
+  // 按时间升序：move@5 < removed@12 < duration@20 < added@30
+  check(
+    'snapshot diff sorted by time',
+    d.map((e) => e.time),
+    [5, 12, 20, 30],
+  );
+  const mv = d[0];
+  check('snapshot moved flags', [mv.moved, mv.durationChanged], [true, false]);
+  check('snapshot moved ranges', [mv.before, mv.after], [
+    { start: 2, end: 4 },
+    { start: 5, end: 7 },
+  ]);
+  const rz = d[2];
+  check('snapshot duration flags', [rz.moved, rz.durationChanged], [false, true]);
+  check('snapshot duration ranges', [rz.before, rz.after], [
+    { start: 20, end: 22 },
+    { start: 20, end: 24 },
+  ]);
+  check('snapshot kept interval omitted', d.some((e) => e.intervalId === 'keep'), false);
+}
+
+// 29. 半开区间语义：仅末尾时刻变化、时长不变不算差异；完全一致也不算
+{
+  const p = relayProject([[]], { minSingers: 1, bpm: 120 });
+  const s0 = p.singers[0].id;
+  const base: Project = { ...p, singers: [{ ...p.singers[0], breaths: [{ id: 'a', start: 2, end: 4 }] }] };
+  const snap = createSnapshot(base);
+  // 微小浮点抖动（< EPS）视为无差异
+  const jitter = updateBreath(base, s0, 'a', 2 + 1e-9, 4 + 1e-9);
+  check('snapshot jitter no diff', diffProjectSnapshot(jitter, snap), []);
+  // [2,4) → [2,5)：起点不变，时长 +1
+  const longer = updateBreath(base, s0, 'a', 2, 5);
+  check('snapshot extend type', diffProjectSnapshot(longer, snap).map((e) => e.type), ['duration']);
+  // [2,4) → [3,4)：终点不变、起点 +1，时长 -1 → moved（非 duration）
+  const leftCut = updateBreath(base, s0, 'a', 3, 4);
+  const d = diffProjectSnapshot(leftCut, snap);
+  check('snapshot left-cut type', d.map((e) => [e.type, e.moved, e.durationChanged]), [['moved', true, true]]);
+}
+
+// 30. 对齐以歌手 ID 为准：歌手改名不产生新增 / 删除；ID 不同的歌手视为增删
+{
+  const p = relayProject([[[1, 2]]], { minSingers: 1, bpm: 120 });
+  const s0 = p.singers[0].id;
+  const snap = createSnapshot(p);
+  const renamed: Project = {
+    ...p,
+    singers: p.singers.map((s) => (s.id === s0 ? { ...s, name: '新名字' } : s)),
+  };
+  const d = diffProjectSnapshot(renamed, snap);
+  check('snapshot rename aligned by id', d, []);
+  check('snapshot rename shows current name', diffStructure(renamed, snap).addedSingers, []);
+
+  const replaced: Project = {
+    ...p,
+    singers: [{ id: 'other-id', name: '另一个人', partId: 'p1', breaths: [{ id: 'b2', start: 1, end: 2 }] }],
+  };
+  const d2 = diffProjectSnapshot(replaced, snap);
+  check(
+    'snapshot different singer id add/remove',
+    d2.map((e) => [e.type, e.singerName, e.intervalId]),
+    [
+      ['removed', '歌手1', d2.find((x) => x.type === 'removed')!.intervalId],
+      ['added', '另一个人', 'b2'],
+    ],
+  );
+  check(
+    'snapshot different singer structure',
+    diffStructure(replaced, snap),
+    { addedSingers: ['另一个人'], removedSingers: ['歌手1'], addedParts: [], removedParts: [] },
+  );
+}
+
+// 31. 同时刻按歌手名排序：两位歌手同秒新增，名字序在前
+{
+  const p = relayProject([[], []], { minSingers: 1, bpm: 120 });
+  const named: Project = {
+    ...p,
+    singers: p.singers.map((s, i) => ({ ...s, name: i === 0 ? '赵敏' : '安' })),
+  };
+  const snap = createSnapshot(named);
+  const cur: Project = {
+    ...named,
+    singers: named.singers.map((s) => ({ ...s, breaths: [{ id: `b-${s.id}`, start: 10, end: 11 }] })),
+  };
+  check(
+    'snapshot same-time name order',
+    diffProjectSnapshot(cur, snap).map((e) => e.singerName),
+    ['安', '赵敏'],
+  );
+}
+
+// 32. 恢复快照：声部 / 歌手 / 区间回到快照；节拍图、曲名、全曲时长保持当前现状
+{
+  const p = relayProject([[[1, 2]]], { minSingers: 1, bpm: 120 });
+  const snap = createSnapshot(p);
+  const edited: Project = {
+    ...p,
+    name: '排练中的新曲名',
+    duration: 40,
+    beatMap: normalizeBeatMap({ startBpm: 60 }),
+    singers: [{ id: 'newcomer', name: '新人', partId: 'p1', breaths: [{ id: 'x', start: 30, end: 32 }] }],
+  };
+  const restored = restoreProjectSnapshot(edited, snap);
+  check('restore keeps current name', restored.name, '排练中的新曲名');
+  check('restore keeps current duration', restored.duration, 40);
+  check('restore keeps current beatmap', restored.beatMap.startBpm, 60);
+  check(
+    'restore replaces singers',
+    restored.singers.map((s) => [s.id, s.breaths.map((b) => [b.start, b.end])]),
+    p.singers.map((s) => [s.id, s.breaths.map((b) => [b.start, b.end])]),
+  );
+  // 恢复结果是深拷贝：再改恢复后的工程不影响快照
+  restored.singers[0].breaths.push({ id: 'tamper', start: 0, end: 1 });
+  check('restore is deep copy', snap.singers[0].breaths.some((b) => b.id === 'tamper'), false);
+}
+
+// 33. 声部增删的结构差异统计
+{
+  const p = createSampleProject();
+  const snap = createSnapshot(p);
+  const removedPartId = p.parts[0].id;
+  const cur: Project = {
+    ...p,
+    parts: [...p.parts.slice(1), { id: 'newpart', name: '童声', color: '#fff', minSingers: 1 }],
+    singers: p.singers.filter((s) => s.partId !== removedPartId),
+  };
+  const st = diffStructure(cur, snap);
+  check('snapshot structure added parts', st.addedParts, ['童声']);
+  check('snapshot structure removed parts', st.removedParts, [p.parts[0].name]);
+  check('snapshot structure removed singers count', st.removedSingers.length, 3);
+  check('snapshot structure added singers', st.addedSingers, []);
+}
+
+// 34. 默认快照名包含「排练快照」前缀
+check('snapshot default name prefix', defaultSnapshotName(new Date('2026-09-21T10:05:00')).startsWith('排练快照 '), true);
+{
+  const p = relayProject([[]], { bpm: 120 });
+  check('snapshot blank name falls back', createSnapshot(p, '   ').name.startsWith('排练快照 '), true);
+  check('snapshot trims name', createSnapshot(p, '  周三联排  ').name, '周三联排');
+}
+
+// 35. 快照清洗：合法数据通过，非法声部 / 区间被丢弃或整体拒绝
+{
+  const p = relayProject([[[1, 2], [3, 3]]], { minSingers: 1, bpm: 120 });
+  const snap = createSnapshot(p);
+  const again = sanitizeSnapshot(JSON.parse(JSON.stringify(snap)));
+  check('snapshot sanitize roundtrip ids', again?.id, snap.id);
+  check('snapshot sanitize drops zero-length breath', again?.singers[0].breaths.length, 1);
+
+  check('snapshot sanitize rejects junk', sanitizeSnapshot(null), null);
+  check('snapshot sanitize rejects no parts', sanitizeSnapshot({ parts: [], singers: [] }), null);
+  {
+    // 声部合法但歌手引用了不存在的声部：歌手被过滤，快照仍合法（歌手数为 0）
+    const orphan = sanitizeSnapshot({
+      parts: [{ id: 'p1', name: 'P', color: '#000', minSingers: 1 }],
+      singers: [{ id: 's1', name: 'S', partId: 'nope', breaths: [] }],
+    });
+    check('snapshot sanitize drops orphan singer', orphan?.singers.length, 0);
+    check('snapshot sanitize keeps part', orphan?.parts.length, 1);
+  }
+}
+
+// 36. 快照持久化：内存版 localStorage 存取（按创建时间倒序）
+{
+  const store = new Map<string, string>();
+  (globalThis as Record<string, unknown>).localStorage = {
+    getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+    setItem: (k: string, v: string) => void store.set(k, v),
+    removeItem: (k: string) => void store.delete(k),
+  };
+  const p = relayProject([[[1, 2]]], { bpm: 120 });
+  const older = createSnapshot(p, '早', new Date('2026-09-01T09:00:00'));
+  const newer = createSnapshot(p, '晚', new Date('2026-09-21T09:00:00'));
+  saveSnapshots([older, newer]);
+  const loaded = loadSnapshots();
+  check('snapshots persist count', loaded.length, 2);
+  check('snapshots newest first', loaded.map((s) => s.name), ['晚', '早']);
+  // 损坏的存储数据不致命
+  store.set('breath-relay:snapshots:v1', '{not json');
+  check('snapshots corrupt storage safe', loadSnapshots(), []);
 }
 
 console.log(failures === 0 ? '\nALL TESTS PASSED' : `\n${failures} TEST(S) FAILED`);

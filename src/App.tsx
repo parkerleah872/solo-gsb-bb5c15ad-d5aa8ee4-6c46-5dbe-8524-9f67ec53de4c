@@ -1,7 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { Project, Selection } from './types';
+import type { Project, RehearsalSnapshot, Selection } from './types';
 import { createSampleProject } from './lib/sample';
 import { loadProject, sanitizeProject, saveProject, uid } from './lib/storage';
+import {
+  createSnapshot,
+  loadSnapshots,
+  restoreProjectSnapshot,
+  saveSnapshots,
+} from './lib/snapshot';
 import { normalizeBeatMap } from './lib/tempo';
 import { partUnder, totalSeconds, type Segment } from './lib/coverage';
 import { applyMove, findBestMove, type OptimizeResult } from './lib/optimize';
@@ -22,6 +28,7 @@ export default function App() {
   const [relay, setRelay] = useState<RelaySuccess | null>(null);
   const [pxPerSec, setPxPerSec] = useState(10);
   const [savedAt, setSavedAt] = useState<Date | null>(null);
+  const [snapshots, setSnapshots] = useState<RehearsalSnapshot[]>(() => loadSnapshots());
   const fileRef = useRef<HTMLInputElement>(null);
 
   // 本地自动保存（刷新后自动恢复）
@@ -29,6 +36,11 @@ export default function App() {
     saveProject(project);
     setSavedAt(new Date());
   }, [project]);
+
+  // 排练快照单独持久化（快照不随当前工程自动保存而改变）
+  useEffect(() => {
+    saveSnapshots(snapshots);
+  }, [snapshots]);
 
   const clearOptimization = useCallback(() => {
     setResult(null);
@@ -232,6 +244,27 @@ export default function App() {
     setProject(createSampleProject());
   };
 
+  // ---------- 排练快照 ----------
+  /** 保存当前工程快照：冻结声部、歌手与换气区间（寻优 / 接力预览不影响快照内容）。 */
+  const handleCreateSnapshot = (name: string) => {
+    setSnapshots((list) => [createSnapshot(project, name), ...list]);
+  };
+
+  const handleDeleteSnapshot = (snapshotId: string) => {
+    setSnapshots((list) => list.filter((s) => s.id !== snapshotId));
+  };
+
+  /**
+   * 恢复快照：用快照中的声部 / 歌手 / 换气区间整体替换当前工程；
+   * 节拍图、曲名与全曲时长保持现状。恢复后清除当前选中段与接力 / 寻优预览。
+   */
+  const handleRestoreSnapshot = (snapshot: RehearsalSnapshot) => {
+    clearOptimization();
+    clearRelay();
+    setSelection(null);
+    setProject((p) => restoreProjectSnapshot(p, snapshot));
+  };
+
   return (
     <div className="app">
       <header className="app-header">
@@ -258,7 +291,16 @@ export default function App() {
       </header>
 
       <div className="layout">
-        <Sidebar project={project} coverage={coverage} mutate={mutate} mutateBeatMap={mutateBeatMap} />
+        <Sidebar
+          project={project}
+          coverage={coverage}
+          mutate={mutate}
+          mutateBeatMap={mutateBeatMap}
+          snapshots={snapshots}
+          onCreateSnapshot={handleCreateSnapshot}
+          onRestoreSnapshot={handleRestoreSnapshot}
+          onDeleteSnapshot={handleDeleteSnapshot}
+        />
 
         <main className="main">
           <div className="toolbar">
