@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { Project, Selection } from './types';
+import type { Project, Selection, Snapshot } from './types';
 import { createSampleProject } from './lib/sample';
 import { loadProject, sanitizeProject, saveProject, uid } from './lib/storage';
+import { applySnapshot, loadSnapshots, saveSnapshots, takeSnapshot } from './lib/snapshots';
 import { normalizeBeatMap } from './lib/tempo';
 import { partUnder, totalSeconds, type Segment } from './lib/coverage';
 import { applyMove, findBestMove, type OptimizeResult } from './lib/optimize';
@@ -22,6 +23,7 @@ export default function App() {
   const [relay, setRelay] = useState<RelaySuccess | null>(null);
   const [pxPerSec, setPxPerSec] = useState(10);
   const [savedAt, setSavedAt] = useState<Date | null>(null);
+  const [snapshots, setSnapshots] = useState<Snapshot[]>(() => loadSnapshots());
   const fileRef = useRef<HTMLInputElement>(null);
 
   // 本地自动保存（刷新后自动恢复）
@@ -29,6 +31,11 @@ export default function App() {
     saveProject(project);
     setSavedAt(new Date());
   }, [project]);
+
+  // 快照列表随增删自动持久化
+  useEffect(() => {
+    saveSnapshots(snapshots);
+  }, [snapshots]);
 
   const clearOptimization = useCallback(() => {
     setResult(null);
@@ -200,6 +207,35 @@ export default function App() {
     setRelay(null);
   };
 
+  // ---------- 排练快照 ----------
+  /** 保存当前工程的命名快照（深拷贝冻结，之后的编辑不影响快照）。 */
+  const saveSnapshot = useCallback(
+    (name: string) => {
+      setSnapshots((prev) => [...prev, takeSnapshot(project, name)]);
+    },
+    [project],
+  );
+
+  /**
+   * 恢复快照（面板内已二次确认）：用快照覆盖声部、歌手与换气区间，
+   * 节拍图保持现状不被覆盖；恢复后清除当前选中段与寻优 / 接力预览。
+   */
+  const restoreSnapshot = useCallback(
+    (id: string) => {
+      const snap = snapshots.find((s) => s.id === id);
+      if (!snap) return;
+      clearOptimization();
+      clearRelay();
+      setSelection(null);
+      setProject((p) => applySnapshot(p, snap));
+    },
+    [snapshots, clearOptimization, clearRelay],
+  );
+
+  const deleteSnapshot = useCallback((id: string) => {
+    setSnapshots((prev) => prev.filter((s) => s.id !== id));
+  }, []);
+
   // ---------- 导入 / 导出 ----------
   const exportJson = () => {
     const blob = new Blob([JSON.stringify(project, null, 2)], { type: 'application/json' });
@@ -258,7 +294,16 @@ export default function App() {
       </header>
 
       <div className="layout">
-        <Sidebar project={project} coverage={coverage} mutate={mutate} mutateBeatMap={mutateBeatMap} />
+        <Sidebar
+          project={project}
+          coverage={coverage}
+          mutate={mutate}
+          mutateBeatMap={mutateBeatMap}
+          snapshots={snapshots}
+          onSaveSnapshot={saveSnapshot}
+          onRestoreSnapshot={restoreSnapshot}
+          onDeleteSnapshot={deleteSnapshot}
+        />
 
         <main className="main">
           <div className="toolbar">

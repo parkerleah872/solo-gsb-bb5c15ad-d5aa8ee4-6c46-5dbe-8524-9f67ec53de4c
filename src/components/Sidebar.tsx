@@ -1,4 +1,4 @@
-import type { Project } from '../types';
+import type { Project, Snapshot } from '../types';
 import { totalSeconds, type UnderSegment } from '../lib/coverage';
 import { MIN_DURATION, clamp } from '../lib/constraints';
 import { uid } from '../lib/id';
@@ -9,6 +9,7 @@ import {
   timeToLocation,
   updateBeatMap,
 } from '../lib/tempo';
+import SnapshotPanel from './SnapshotPanel';
 
 interface Props {
   project: Project;
@@ -17,11 +18,24 @@ interface Props {
   mutate: (fn: (p: Project) => Project) => void;
   /** 修改节拍图（不影响换气段的秒位置，也不使寻优结果失效） */
   mutateBeatMap: (fn: (b: Project['beatMap']) => Project['beatMap']) => void;
+  snapshots: Snapshot[];
+  onSaveSnapshot: (name: string) => void;
+  onRestoreSnapshot: (id: string) => void;
+  onDeleteSnapshot: (id: string) => void;
 }
 
 const PALETTE = ['#f472b6', '#a78bfa', '#60a5fa', '#34d399', '#fbbf24', '#f87171', '#22d3ee', '#c084fc'];
 
-export default function Sidebar({ project, coverage, mutate, mutateBeatMap }: Props) {
+export default function Sidebar({
+  project,
+  coverage,
+  mutate,
+  mutateBeatMap,
+  snapshots,
+  onSaveSnapshot,
+  onRestoreSnapshot,
+  onDeleteSnapshot,
+}: Props) {
   const beatMap = project.beatMap;
 
   // ---------- 节拍图 ----------
@@ -272,6 +286,14 @@ export default function Sidebar({ project, coverage, mutate, mutateBeatMap }: Pr
         </button>
       </section>
 
+      <SnapshotPanel
+        project={project}
+        snapshots={snapshots}
+        onSave={onSaveSnapshot}
+        onRestore={onRestoreSnapshot}
+        onDelete={onDeleteSnapshot}
+      />
+
       <section className="side-section tips">
         <h3>💡 操作提示</h3>
         <ul>
@@ -280,6 +302,7 @@ export default function Sidebar({ project, coverage, mutate, mutateBeatMap }: Pr
           <li>时间轴可在「秒 / 拍」标尺间切换，勾选「按拍吸附」后新增与拖拽自动落到整拍</li>
           <li>点击换气段选中后，可在右下方面板一键寻优</li>
           <li>在下方「声部接力排程」选择声部、起止拍位与每人换气拍数，可回溯搜索整组接力换气，幽灵块预览后再整组写入</li>
+          <li>「排练快照」可保存当前换气安排，随时对比差异或二次确认后恢复（节拍图不被覆盖）</li>
           <li>Delete / Backspace：删除选中的换气段</li>
         </ul>
       </section>

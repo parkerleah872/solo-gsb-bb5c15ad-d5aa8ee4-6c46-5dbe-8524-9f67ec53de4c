@@ -14,6 +14,14 @@ import {
 } from '../src/lib/tempo';
 import { placeNewIntervalOnBeat } from '../src/lib/constraints';
 import { applyRelay, planRelay } from '../src/lib/relay';
+import {
+  applySnapshot,
+  diffProject,
+  loadSnapshots,
+  sanitizeSnapshots,
+  saveSnapshots,
+  takeSnapshot,
+} from '../src/lib/snapshots';
 import type { Project } from '../src/types';
 import { uid } from '../src/lib/id';
 
@@ -389,6 +397,203 @@ const beatTimes = (p: Project, beats: number[]) => beats.map((b) => beatToTime(b
         .sort((x, y) => x[0] - y[0]),
     );
   }
+}
+
+// ---------- 排练快照：冻结、按歌手 ID 对齐的差异、恢复 ----------
+
+/** 固定 ID 的测试工程：甲 [0,2) [10,12)，乙 [20,23)。 */
+function snapProject(): Project {
+  const part = { id: 'p1', name: '女高', color: '#f472b6', minSingers: 1 };
+  return {
+    name: 'snap-test',
+    duration: 60,
+    beatMap: normalizeBeatMap(undefined),
+    parts: [part],
+    singers: [
+      {
+        id: 's1',
+        name: '甲',
+        partId: 'p1',
+        breaths: [
+          { id: 'b1', start: 0, end: 2 },
+          { id: 'b2', start: 10, end: 12 },
+        ],
+      },
+      { id: 's2', name: '乙', partId: 'p1', breaths: [{ id: 'b3', start: 20, end: 23 }] },
+    ],
+  };
+}
+
+// 27. 快照深拷贝冻结：保存后修改工程不影响快照；空白名称回退默认
+{
+  const p = snapProject();
+  const snap = takeSnapshot(p, '基线', new Date('2026-09-21T08:00:00Z'));
+  check('snapshot name', snap.name, '基线');
+  check('snapshot createdAt', snap.createdAt, '2026-09-21T08:00:00.000Z');
+  p.singers[0].breaths[0].start = 99;
+  p.parts[0].name = '改名';
+  check('snapshot frozen after edits', [snap.project.singers[0].breaths[0].start, snap.project.parts[0].name], [0, '女高']);
+  check('snapshot blank name fallback', takeSnapshot(snapProject(), '   ').name, '未命名快照');
+}
+
+// 28. 与快照一致 → 无差异；浮点噪声（半开区间端点 EPS 容差）也不算差异
+{
+  check('diff identical empty', diffProject(snapProject(), takeSnapshot(snapProject(), 'x')), []);
+  const snap = takeSnapshot(snapProject(), 'base');
+  const cur = snapProject();
+  cur.singers[0].breaths[0] = { id: 'b1', start: 1e-9, end: 2 };
+  check('diff eps tolerance', diffProject(cur, snap), []);
+}
+
+// 29. 新增：当前多出的区间 → added，记录当前区间、无旧区间
+{
+  const snap = takeSnapshot(snapProject(), 'base');
+  const cur = snapProject();
+  cur.singers[0].breaths.push({ id: 'b9', start: 30, end: 31 });
+  const d = diffProject(cur, snap);
+  check('diff added count', d.length, 1);
+  check(
+    'diff added entry',
+    [d[0].kind, d[0].singerId, d[0].singerName, d[0].partName, d[0].start, d[0].end, d[0].oldStart],
+    ['added', 's1', '甲', '女高', 30, 31, null],
+  );
+}
+
+// 30. 删除：快照有而当前没有 → removed，保留快照中的旧区间
+{
+  const snap = takeSnapshot(snapProject(), 'base');
+  const cur = snapProject();
+  cur.singers[1].breaths = [];
+  const d = diffProject(cur, snap);
+  check(
+    'diff removed entry',
+    d.map((x) => [x.kind, x.singerName, x.start, x.end, x.oldStart, x.oldEnd]),
+    [['removed', '乙', 20, 23, 20, 23]],
+  );
+}
+
+// 31. 移动：起止都变、时长不变 → moved
+{
+  const snap = takeSnapshot(snapProject(), 'base');
+  const cur = snapProject();
+  cur.singers[0].breaths[0] = { ...cur.singers[0].breaths[0], start: 4, end: 6 };
+  const d = diffProject(cur, snap);
+  check(
+    'diff moved entry',
+    d.map((x) => [x.kind, x.oldStart, x.oldEnd, x.start, x.end]),
+    [['moved', 0, 2, 4, 6]],
+  );
+}
+
+// 32. 时长变化：起点不变、终点变 → resized
+{
+  const cur = snapProject();
+  cur.singers[0].breaths[0] = { ...cur.singers[0].breaths[0], end: 3.5 };
+  const d = diffProject(cur, takeSnapshot(snapProject(), 'base'));
+  check(
+    'diff resized entry',
+    d.map((x) => [x.kind, x.oldEnd, x.end]),
+    [['resized', 2, 3.5]],
+  );
+}
+
+// 33. 起止与时长同时变化 → 归时长变化
+{
+  const cur = snapProject();
+  cur.singers[0].breaths[0] = { ...cur.singers[0].breaths[0], start: 1, end: 4 };
+  const d = diffProject(cur, takeSnapshot(snapProject(), 'base'));
+  check(
+    'diff start+duration changed is resized',
+    d.map((x) => x.kind),
+    ['resized'],
+  );
+}
+
+// 34. 半开语义：新增与已有区间首尾相接 [0,2)+[2,4) 各自独立，只报一条新增
+{
+  const snap = takeSnapshot(snapProject(), 'base');
+  const cur = snapProject();
+  cur.singers[0].breaths.push({ id: 'b9', start: 2, end: 4 });
+  const d = diffProject(cur, snap);
+  check(
+    'half-open adjacency stays separate',
+    d.map((x) => [x.kind, x.start, x.end]),
+    [['added', 2, 4]],
+  );
+}
+
+// 35. 歌手增删：删除歌手的区间全部计删除，新歌手的区间全部计新增
+{
+  const snap = takeSnapshot(snapProject(), 'base');
+  const cur = snapProject();
+  cur.singers = cur.singers.filter((s) => s.id !== 's2');
+  cur.singers.push({ id: 's3', name: '丙', partId: 'p1', breaths: [{ id: 'b7', start: 40, end: 41 }] });
+  const d = diffProject(cur, snap);
+  check(
+    'singer added/removed diffs',
+    d.map((x) => [x.kind, x.singerName, x.start]),
+    [
+      ['removed', '乙', 20],
+      ['added', '丙', 40],
+    ],
+  );
+}
+
+// 36. 差异按时间排序：新增 [5,6) → 删除 [20,23) → 移动到 [40,42)
+{
+  const snap = takeSnapshot(snapProject(), 'base');
+  const cur = snapProject();
+  cur.singers[0].breaths[1] = { ...cur.singers[0].breaths[1], start: 40, end: 42 };
+  cur.singers[0].breaths.push({ id: 'b9', start: 5, end: 6 });
+  cur.singers[1].breaths = [];
+  const d = diffProject(cur, snap);
+  check(
+    'diff sorted by time',
+    d.map((x) => [x.kind, x.time]),
+    [
+      ['added', 5],
+      ['removed', 20],
+      ['moved', 40],
+    ],
+  );
+}
+
+// 37. 恢复：声部/歌手/换气与曲名时长被快照覆盖，节拍图保持现状；恢复快照深拷贝
+{
+  const snap = takeSnapshot(snapProject(), 'v1');
+  const cur = snapProject();
+  cur.name = '改名';
+  cur.duration = 90;
+  cur.singers = [];
+  cur.beatMap = normalizeBeatMap({ startBpm: 90, changes: [{ id: 'tc', measure: 5, bpm: 60 }] });
+  const restored = applySnapshot(cur, snap);
+  check(
+    'restore singers',
+    restored.singers.map((s) => s.id),
+    ['s1', 's2'],
+  );
+  check('restore name/duration', [restored.name, restored.duration], ['snap-test', 60]);
+  check('restore keeps current beatmap', restored.beatMap, cur.beatMap);
+  restored.singers[0].breaths[0].start = 55;
+  check('restore deep-copies snapshot', snap.project.singers[0].breaths[0].start, 0);
+}
+
+// 38. 快照列表清洗与本地持久化（localStorage 桩）
+{
+  const store = new Map<string, string>();
+  (globalThis as Record<string, unknown>).localStorage = {
+    getItem: (k: string) => store.get(k) ?? null,
+    setItem: (k: string, v: string) => void store.set(k, v),
+    removeItem: (k: string) => void store.delete(k),
+  };
+  const snaps = [takeSnapshot(snapProject(), 'A'), takeSnapshot(snapProject(), 'B')];
+  saveSnapshots(snaps);
+  check('snapshot persistence roundtrip', loadSnapshots(), snaps);
+  check(
+    'sanitize snapshots drops junk',
+    sanitizeSnapshots([{ id: 'x', name: 'bad', project: { nope: 1 } }, null, 42, snaps[0]]),
+    [snaps[0]],
+  );
 }
 
 console.log(failures === 0 ? '\nALL TESTS PASSED' : `\n${failures} TEST(S) FAILED`);

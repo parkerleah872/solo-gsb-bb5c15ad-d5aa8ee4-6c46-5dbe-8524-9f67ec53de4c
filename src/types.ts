@@ -59,3 +59,15 @@ export interface Selection {
   singerId: string;
   intervalId: string;
 }
+
+/**
+ * 排练快照：保存时冻结整个工程（声部、歌手及换气区间）。
+ * 快照中的节拍图仅作存档记录，恢复时不会覆盖当前工程的节拍图。
+ */
+export interface Snapshot {
+  id: string;
+  name: string;
+  /** ISO 时间串 */
+  createdAt: string;
+  project: Project;
+}
